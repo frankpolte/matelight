@@ -1,187 +1,132 @@
 #!/usr/bin/env python
+# Matelight
+# Copyright (C) 2016 Sebastian Götte <code@jaseg.net>
+# Copyright (C) 2015 Uwe Kamper <me@uwekamper.de>
+# 
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-from socketserver import *
 import socket
-import struct
-import zlib
-from time import time, strftime, sleep
-from collections import namedtuple, deque
+import time
 import itertools
-import threading
-import random
-import os
 import sys
+import re
+from contextlib import suppress
+import asyncio
+import threading
+import functools
+import operator
 
-from ctypes import *
+import config
 
-from matelight import sendframe, DISPLAY_WIDTH, DISPLAY_HEIGHT, FRAME_SIZE
+import matelight
+import bdf
+import crap
 
-UDP_TIMEOUT = 3.0
+import secret_sauce
 
-class COLOR(Structure):
-		_fields_ = [('r', c_uint8), ('g', c_uint8), ('b', c_uint8), ('a', c_uint8)]
-
-class FRAMEBUFFER(Structure):
-		_fields_ = [('data', POINTER(COLOR)), ('w', c_size_t), ('h', c_size_t)]
-
-bdf = CDLL('./libbdf.so')
-bdf.read_bdf_file.restype = c_void_p
-bdf.framebuffer_render_text.restype = POINTER(FRAMEBUFFER)
-bdf.framebuffer_render_text.argtypes= [c_char_p, c_void_p, c_void_p, c_size_t, c_size_t, c_size_t]
-
-unifont = bdf.read_bdf_file('unifont.bdf')
-
-def compute_text_bounds(text):
-	assert unifont
-	textbytes = bytes(str(text), 'UTF-8')
-	textw, texth = c_size_t(0), c_size_t(0)
-	res = bdf.framebuffer_get_text_bounds(textbytes, unifont, byref(textw), byref(texth))
-	if res:
-		raise ValueError('Invalid text')
-	return textw.value, texth.value
-
-cbuf = create_string_buffer(FRAME_SIZE*sizeof(COLOR))
-cbuflock = threading.Lock()
-def render_text(text, offset):
-	global cbuf
-	cbuflock.acquire()
-	textbytes = bytes(str(text), 'UTF-8')
-	res = bdf.framebuffer_render_text(textbytes, unifont, cbuf, DISPLAY_WIDTH, DISPLAY_HEIGHT, offset)
-	if res:
-		raise ValueError('Invalid text')
-	cbuflock.release()
-	return cbuf
-
-printlock = threading.Lock()
-
-def printframe(fb):
-	printlock.acquire()
-	print('\0337\033[H', end='')
-	print('Rendering frame @{}'.format(time()))
-	bdf.console_render_buffer(fb, DISPLAY_WIDTH, DISPLAY_HEIGHT)
-	#print('\033[0m\033[KCurrently rendering', current_entry.entrytype, 'from', current_entry.remote, ':', current_entry.text, '\0338', end='')
-	printlock.release()
 
 def log(*args):
-	printlock.acquire()
-	print(strftime('\x1B[93m[%m-%d %H:%M:%S]\x1B[0m'), ' '.join(str(arg) for arg in args), '\x1B[0m')
-	sys.stdout.flush()
-	printlock.release()
+    print(time.strftime('\x1B[93m[%m-%d %H:%M:%S]\x1B[0m'), ' '.join(str(arg) for arg in args), '\x1B[0m')
+    sys.stdout.flush()
+
+def addrcolor(addr):
+    col = 16 + (functools.reduce(operator.xor, (int(e or '0') for e in re.split('[.:]', addr))) % 216)
+    return '\x1B[38;5;{}m{}\x1B[0m'.format(col, addr)
+
 
 class TextRenderer:
-	def __init__(self, text):
-		self.text = text
-		self.width, _ = compute_text_bounds(text)
+    def __init__(self, text, title='default', checkwidth=False, font=bdf.unifont):
+        self.text = text
+        self.font = font
+        (self.width, _), _testrender  = font.compute_text_bounds(text), font.render_text(text, 0)
+        self.title = title
+        if self.width > config.max_marquee_width:
+            raise ValueError()
 
-	def __iter__(self):
-		for i in range(-DISPLAY_WIDTH, self.width):
-			#print('Rendering text @ pos {}'.format(i))
-			yield render_text(self.text, i)
+    def __iter__(self):
+        for i in range(-config.display_width, self.width):
+            yield self.title, self.font.render_text(self.text, i)
+            time.sleep(0.05)
 
-class MateLightUDPServer:
-	def __init__(self, port=1337, ip=''):
-		self.current_client = None
-		self.last_timestamp = 0
-		self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-		self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-		self.socket.bind((ip, port))
-		self.thread = threading.Thread(target = self.udp_receive)
-		self.thread.daemon = True
-		self.start = self.thread.start
-		self.frame_condition = threading.Condition()
-		self.frame = None
-	
-	def frame_da(self):
-		return self.frame is not None
+class MatelightTCPServer:
+    def __init__(self, ip, port, loop):
+        coro = asyncio.start_server(self.handle_conn, ip, port, loop=loop)
+        server = loop.run_until_complete(coro)
+        self.renderqueue = []
+        self.close = server.close
 
-	def __iter__(self):
-		while True:
-			with self.frame_condition:
-				if not self.frame_condition.wait_for(self.frame_da, timeout=UDP_TIMEOUT):
-					raise StopIteration()
-				frame, self.frame = self.frame, None
-			yield frame
+    def __iter__(self):
+        q, self.renderqueue = self.renderqueue, []
+        for title, frame in itertools.chain(*q):
+            yield title, frame
 
-	def udp_receive(self):
-		while True:
-			try:
-				data, (addr, sport) = self.socket.recvfrom(FRAME_SIZE*3+4)
-				timestamp = time()
-				if timestamp - self.last_timestamp > UDP_TIMEOUT:
-					self.current_client = addr
-					log('\x1B[91mAccepting UDP data from\x1B[0m', addr)
-				if addr == self.current_client:
-					if len(data) == FRAME_SIZE*3+4:
-						frame = data[:-4]
-						crc1, = struct.unpack('!I', data[-4:])
-						if crc1:
-							crc2, = zlib.crc32(frame, 0),
-							if crc1 != crc2:
-								raise ValueError('Invalid frame CRC checksum: Expected {}, got {}'.format(crc2, crc1))
-					elif len(data) == FRAME_SIZE*3:
-						frame = data
-					else:
-						raise ValueError('Invalid frame size: {}'.format(len(data)))
-					self.last_timestamp = timestamp
-					with self.frame_condition:
-						self.frame = frame
-						self.frame_condition.notify()
-			except Exception as e:
-				log('Error receiving UDP frame:', e)
+    async def handle_conn(self, reader, writer):
+        line = (await reader.read(1024)).decode('UTF-8').strip()
+        addr,*rest = writer.get_extra_info('peername')
 
-renderqueue = deque()
+        log('\x1B[95mText from\x1B[0m {}: {}\x1B[0m'.format(addrcolor(addr), line))
+        try:
+            secret_sauce.check_spam(str(addr), line)
+            renderer = TextRenderer(line, title='tcp:'+addr, checkwidth=True)
+        except secret_sauce.SpamError as err:
+            log('\x1B[91mMessage rejected from {}: {}'.format(addrcolor(addr), err))
+            writer.write(b'BLERGH!\n')
+        except ValueError: # Text too long
+            writer.write(b'TOO MUCH INFORMATION!\n')
+        except RuntimeError: # Invalid escape etc.
+            writer.write(b'STAHPTROLLINK?\n')
+        else:
+            self.renderqueue.append(renderer)
+            writer.write(b'KTHXBYE!\n')
+        await writer.drain()
+        writer.close()
 
-class MateLightTCPTextHandler(BaseRequestHandler):
-	def handle(self):
-		global render_deque
-		data = str(self.request.recv(1024).strip(), 'UTF-8')
-		addr = self.client_address[0]
-		if len(data) > 140:
-			self.request.sendall(b'TOO MUCH INFORMATION!\n')
-			return
-		log('\x1B[95mText from\x1B[0m {}: {}\x1B[0m'.format(addr, data))
-		renderqueue.append(TextRenderer(data))
-		self.request.sendall(b'KTHXBYE!\n')
+def _fallbackiter(it, fallback):
+    for fel in fallback:
+        for el in it:
+            yield el
+        yield fel
 
-TCPServer.allow_reuse_address = True
-tserver = TCPServer(('', 1337), MateLightTCPTextHandler)
-t = threading.Thread(target=tserver.serve_forever)
-t.daemon = True
-t.start()
-
-userver = MateLightUDPServer()
-userver.start()
-
-defaultlines = [ TextRenderer(l[:-1].replace('\\x1B', '\x1B')) for l in open('default.lines').readlines() ]
-#random.shuffle(defaultlines)
-defaulttexts = itertools.chain(*defaultlines)
+def defaulttexts(filename='default.lines'):
+    with open(filename) as f:
+        return itertools.chain.from_iterable(( TextRenderer(l[:-1].replace('\\x1B', '\x1B')) for l in f.readlines() ))
 
 if __name__ == '__main__':
-	print('\033[?1049h'+'\n'*9)
-	while True:
-		if renderqueue:
-			renderer = renderqueue.popleft()
-		elif userver.frame_da():
-			renderer = userver
-		else:
-			static_noise = time() % 300 < 60
-			if False:
-				foo = os.urandom(640)
-				frame = bytes([v for c in zip(list(foo), list(foo), list(foo)) for v in c ])
-				sleep(0.05)
-			else:
-				try:
-					frame = next(defaulttexts)
-				except StopIteration:
-					defaultlines = [ TextRenderer(l[:-1].replace('\\x1B', '\x1B')) for l in open('default.lines').readlines() ]
-					#random.shuffle(defaultlines)
-					defaulttexts = itertools.chain(*defaultlines)
-			sendframe(frame)
-#			printframe(frame)
-			continue
-#		sleep(0.1)
-		for frame in renderer:
-			sendframe(frame)
-#			printframe(frame)
-#			sleep(0.1)
+    try:
+        ml = matelight.Matelight(config.ml_usb_serial_match)
+    except ValueError as e:
+        print(e, 'Starting in headless mode.', file=sys.stderr)
+        ml = None
 
+    loop = asyncio.get_event_loop()
+
+    tcp_server = MatelightTCPServer(config.tcp_addr, config.tcp_port, loop)
+    udp_server = crap.CRAPServer(config.udp_addr, config.udp_port)
+    forwarder  = crap.CRAPClient(config.crap_fw_addr, config.crap_fw_port) if config.crap_fw_addr is not None else None
+
+    async_thr = threading.Thread(target=loop.run_forever)
+    async_thr.daemon = True
+    async_thr.start()
+
+    with suppress(KeyboardInterrupt):
+        while True:
+            for title, frame in _fallbackiter(udp_server, _fallbackiter(tcp_server, defaulttexts())):
+                if ml:
+                    ml.sendframe(frame)
+                if forwarder:
+                    forwarder.sendframe(frame)
+
+    tcp_server.close()
+    udp_server.close()
+    forwarder.close()

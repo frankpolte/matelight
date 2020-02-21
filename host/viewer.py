@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # Matelight
 # Copyright (C) 2016 Sebastian Götte <code@jaseg.net>
 # 
@@ -14,22 +15,27 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-from pixelterm.pixelterm import termify_pixels
+import argparse
+import atexit
+from contextlib import suppress
 
-class MockImage:
-    def __init__(self, nparray):
-        self.nparray = nparray
-        self.im = self
+import bdf
+import crap
 
-    @property
-    def size(self):
-        h, w, _ = self.nparray.shape
-        return (w, h)
+atexit.register(print, '\033[?1049l') # Restore normal screen buffer at exit
 
-    def getpixel(self, pos):
-        x, y = pos
-        return tuple(self.nparray[y][x])
+if __name__ == '__main__':
+	parser = argparse.ArgumentParser()
+	parser.add_argument('addr', default='127.0.0.1', nargs='?')
+	parser.add_argument('port', type=int, default=1337, nargs='?')
+	args = parser.parse_args()
 
-def printframe(framedata):
-    print(termify_pixels(MockImage(framedata)))
+	print('\033[?1049h'+'\n'*9)
+	udp_server = crap.CRAPServer(args.addr, args.port, blocking=True, log=lambda *_a: None)
 
+	with suppress(KeyboardInterrupt):
+		while True:
+			for _title, frame in udp_server:
+				bdf.printframe(frame)
+
+	udp_server.close()

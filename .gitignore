@@ -1,2 +1,2 @@
 firmware/gcc/*
-*.swp
+host/secret_sauce.py
